@@ -48,5 +48,15 @@ config IPC_SERVICE_BACKEND_ICMSG_ME_FOLLOWER
 	  on circular packet buffer. This enables enpoint discovery follower
 	  role.
 
+config IPC_SERVICE_BACKEND_ICMSG_WITH_BUF
+	bool "ICMSG backend with separate buffers to hold messages data"
+	default y
+	depends on MBOX
+	depends on DT_HAS_ZEPHYR_IPC_ICMSG_WITH_BUF_ENABLED
+	select IPC_SERVICE_ICMSG
+	help
+	  TODO: help
+
 rsource "Kconfig.icmsg_me"
+rsource "Kconfig.icmsg_with_buf"
 rsource "Kconfig.rpmsg"
