@@ -3,4 +3,22 @@
 
 if IPC_SERVICE_BACKEND_ICMSG_WITH_BUF
 
+config IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP
+	int "Endpoints number"
+	range 1 126
+	default 4
+	help
+	  Number of endpoints supported by the ICmsg with buffers IPC service
+	  backend. The number of endpoints are applied to all the instances,
+	  so this value should have maximum number among all the instances.
+
+config IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_SHMEM_RESET
+	bool "Clear shared memory before initialization"
+	help
+	  Clearint TX buffer before icmsg instance initialization is needed
+	  if the memory was not cleared by hardware or other software modules.
+	  The memory content remaining from the previous run, or garbage data
+	  is going to be incorrectly interpreted by spsc and icmsg instances.
+	  This option adds performance overhead in the initialization process.
+
 endif # IPC_SERVICE_BACKEND_ICMSG_WITH_BUF
