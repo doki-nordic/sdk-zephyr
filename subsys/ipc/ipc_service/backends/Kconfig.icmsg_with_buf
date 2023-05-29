@@ -5,7 +5,7 @@ if IPC_SERVICE_BACKEND_ICMSG_WITH_BUF
 
 config IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP
 	int "Endpoints number"
-	range 1 126
+	range 1 251
 	default 4
 	help
 	  Number of endpoints supported by the ICmsg with buffers IPC service
