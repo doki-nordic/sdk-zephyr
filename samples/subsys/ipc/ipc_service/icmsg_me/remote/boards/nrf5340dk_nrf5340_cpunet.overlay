@@ -53,5 +53,24 @@
 			mbox-names = "rx", "tx";
 			status = "okay";
 		};
+/*
+		ipc0: ipc0 {
+			compatible = "zephyr,ipc-icmsg-me-follower";
+			tx-region = <&sram_ipc0_tx>;
+			rx-region = <&sram_ipc0_rx>;
+			mboxes = <&mbox 0>, <&mbox 1>;
+			mbox-names = "rx", "tx";
+			status = "okay";
+		};
+
+		ipc1: ipc1 {
+			compatible = "zephyr,ipc-icmsg-me-follower";
+			tx-region = <&sram_ipc1_tx>;
+			rx-region = <&sram_ipc1_rx>;
+			mboxes = <&mbox 2>, <&mbox 3>;
+			mbox-names = "rx", "tx";
+			status = "okay";
+		};
+*/
 	};
 };

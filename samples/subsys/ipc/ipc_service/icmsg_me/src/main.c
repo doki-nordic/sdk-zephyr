@@ -88,6 +88,9 @@ static void ipc0A_entry(void *dummy0, void *dummy1, void *dummy2)
 
 	k_sem_take(&ipc0A_bound_sem, K_FOREVER);
 
+	printk("BOUNDED %s\n", __FUNCTION__);
+	//return;
+
 	while (message < 100) {
 		ret = ipc_service_send(&ipc0A_ept, &message, sizeof(message));
 		if (ret < 0) {
@@ -158,6 +161,9 @@ static void ipc0B_entry(void *dummy0, void *dummy1, void *dummy2)
 	}
 
 	k_sem_take(&ipc0B_bound_sem, K_FOREVER);
+
+	printk("BOUNDED %s\n", __FUNCTION__);
+	//return;
 
 	while (message < 100) {
 		ret = ipc_service_send(&ipc0B_ept, &message, sizeof(message));
@@ -234,6 +240,9 @@ static void ipc1_entry(void *dummy0, void *dummy1, void *dummy2)
 
 	k_sem_take(&ipc1_bound_sem, K_FOREVER);
 
+	printk("BOUNDED %s\n", __FUNCTION__);
+	//return;
+
 	/*
 	 * Wait 1 sec to start sending simultaneously with other threads
 	 * the endpoint first
@@ -250,7 +259,7 @@ static void ipc1_entry(void *dummy0, void *dummy1, void *dummy2)
 			printk("get_tx_buffer(%u) failed with ret %d\n", sizeof(message), ret);
 			break;
 		}
-		if (tx_buffer_size != sizeof(message)) {
+		if (tx_buffer_size < sizeof(message)) {
 			printk("get_tx_buffer modified buffer size to unexpected value %u\n",
 					tx_buffer_size);
 			break;
@@ -258,7 +267,7 @@ static void ipc1_entry(void *dummy0, void *dummy1, void *dummy2)
 
 		*((uint8_t *) tx_buffer) = message;
 
-		ret = ipc_service_send_nocopy(&ipc1_ept, tx_buffer, tx_buffer_size);
+		ret = ipc_service_send_nocopy(&ipc1_ept, tx_buffer, sizeof(message));
 		if (ret < 0) {
 			printk("send_message_nocopy(%u) failed with ret %d\n", message, ret);
 			break;

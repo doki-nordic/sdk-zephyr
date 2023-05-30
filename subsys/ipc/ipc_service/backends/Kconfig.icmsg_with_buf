@@ -21,4 +21,9 @@ config IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_SHMEM_RESET
 	  is going to be incorrectly interpreted by spsc and icmsg instances.
 	  This option adds performance overhead in the initialization process.
 
+module = IPC_SERVICE_BACKEND_ICMSG_WITH_BUF
+module-str = ICMSG backend with separate buffers
+module-help = Sets log level for ICMSG backend with separate buffers
+source "subsys/logging/Kconfig.template.log_config"
+
 endif # IPC_SERVICE_BACKEND_ICMSG_WITH_BUF
