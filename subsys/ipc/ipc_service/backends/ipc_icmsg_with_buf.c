@@ -4,8 +4,66 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+/*
+ * ICmsg with buffers backend.
+ *
+ * This is an IPC service backend that dynamically allocates buffers for data transmission
+ * and uses ICmsg as a signaling transport.
+ *
+ * Shared memory organization
+ * --------------------------
+ *
+ * Single channel (RX or TX) of the shared memory is divided into two areas: ICmsg area
+ * followed by Blocks area. Blocks area is evenly divided into aligned blocks.
+ * ICmsg is used to send and receive short 2-bytes messages. Blocks are used to allocate
+ * buffers containing actual data.
+ *
+ * | ICmsg area | Blocks area |
+ *             /               \__________________
+ *            /                                   \
+ *           | Block 0 | Block 1 | ... | Block N-1 |
+ *
+ * Data buffer can span on multiple blocks. First block starts with size of the
+ * following data.
+ *
+ * |    Block i    |   Block i+1   |   Block i+2   |
+ * | size | data_buffer[size]            | padding |
+ *
+ * Sender holds information about reserved blocks using bitarray and it is always
+ * responsible for allocating and releasing the blocks. Receiver just tells sender that
+ * it does not need specific buffer any more.
+ *
+ * ICmsg messages
+ * --------------
+ *
+ * ICmsg is used to send and receive small 2-bytes messages. First byte is an endpoint
+ * address or a message type, second is block index where relevant buffer starts.
+ *
+ *  - Send data
+ *    | receiver endpoint address | block index |
+ *    This message is used to send data buffer to specific endpoint. The same endpoint
+ *    may have different addresses on different sides, so the message contains "receiver"
+ *    address.
+ *
+ *  - Release data
+ *    | MSG_RELEASE_DATA | block index |
+ *    This message is a response to "Send data" message and it is used to inform that
+ *    specific buffer is not used anymore and can be released.
+ *
+ *  - Bound endpoint
+ *    | MSG_BOUND_EPT | block index |
+ *    This message starts bounding of the endpoint. Buffer contains sender endpoint
+ *    address in the first byte followed by null-terminated endpoint name.
+ *
+ *  - Release bound endpoint
+ *    | MSG_RELEASE_BOUND_EPT | block index |
+ *    This message is a response to "Bound endpoint" message and it is used to inform that
+ *    specific buffer is not used anymore and specific endpoint can now receive a data.
+ */
+
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(ipc_svc_icmsg_w_buf, CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_LOG_LEVEL);
+LOG_MODULE_REGISTER(ipc_svc_icmsg_w_buf,
+		    CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_LOG_LEVEL);
 
 #include <string.h>
 
@@ -20,14 +78,14 @@ LOG_MODULE_REGISTER(ipc_svc_icmsg_w_buf, CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_B
 /** Special endpoint address indicating invalid (or empty) entry. */
 #define EPT_ADDR_INVALID 0xFF
 
-/** Message type for deallocating data buffers. */
-#define MSG_FREE_DATA 0xFE
-
-/** Message type for deallocating endpoint registration buffers. */
-#define MSG_FREE_BOUND_EPT 0xFD
+/** Message type for releasing data buffers. */
+#define MSG_RELEASE_DATA 0xFE
 
 /** Message type for endpoint bounding message. */
-#define MSG_BOUND_EPT 0xFC
+#define MSG_BOUND_EPT 0xFD
+
+/** Message type for releasing endpoint bound message buffer. */
+#define MSG_RELEASE_BOUND_EPT 0xFC
 
 /** Maximum value of endpoint address. */
 #define EPT_ADDR_MAX 0xFB
@@ -35,167 +93,109 @@ LOG_MODULE_REGISTER(ipc_svc_icmsg_w_buf, CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_B
 /** Special value for empty entry in bound message waiting table. */
 #define WAITING_BOUND_MSG_EMPTY 0xFFFF
 
+/** Alignment of a block */
 #define BLOCK_ALIGNMENT sizeof(size_t)
+
+/** Number of bytes per each ICmsg message. It is used to calculate size of ICmsg area. */
 #define BYTES_PER_ICMSG_MESSAGE 8
+
+/** Maximum ICmsg overhead. It is used to calculate size of ICmsg area. */
 #define ICMSG_BUFFER_OVERHEAD (2 * (sizeof(struct spsc_pbuf) + BYTES_PER_ICMSG_MESSAGE))
-
-#if 1
-
-#define PUSH do {} while (0)
-#define POP do {} while (0)
-#define SHOW(...) do {} while (0)
-
-#else
-
-const char *call_stack[256];
-int call_stack_size = 0;
-
-#define PUSH call_push(__FUNCTION__);
-#define POP call_pop();
-#define SHOW(...) do { printk(__VA_ARGS__); call_show(); } while (0)
-
-static void call_push(const char *name) {
-	call_stack[call_stack_size++] = name;
-}
-
-static void call_pop() {
-	call_stack_size--;
-}
-
-static void call_show() {
-	int i;
-	for (i = 0; i < call_stack_size; i++) {
-		printk("TR: %s\n", call_stack[i]);
-	}
-}
-
-#endif
-
-#define printk1(...)
-#define printk2(...)
-
-/*
- * Shared memory layout:
- *
- *     | ICMsg queue | block 0 | block 1 | ... | block N-1 |
- *
- *     This shows layout of one channel. There are two channels RX and TX per instance.
- *     ICMsg queue contains enough space to hold at least the same number of messages
- *     as number of blocks on both sides, so it will never overflow.
- *
- * Block layout:
- *
- *     | size_t data_size | data ... |
- *
- *     If buffer spawns more than one block, only the first block contains
- *     'data_size'. 'data_size' value does not include the 'data_size' field.
- *     The 'data_size' field is located in the shared memory, so extra care must
- *     be taken to prevent buffer overflow (or similar) attacks if we don't trust
- *     the other side.
- *
- * ICMsg messages:
- *
- *     | uint8_t message_type_or_ept_addr | uint8_t block_index |
- *
- *     There are four types of messages:
- *
- *     - Endpoint bound (MSG_BOUND_EPT) - send from each side to start bounding process.
- *       Buffer contains:
- *       uint8_t sender endpoint address
- *       char[] null-terminated endpoint name
- *
- *     - Endpoint bound free (MSG_FREE_BOUND_EPT) - send in response to MSG_BOUND_EPT to
- *       deallocate the buffer and inform that bounding request has completed.
- *
- *     - Data (receiver endpoint address) - send the actual payload over specified endpoint.
- *
- *     - Data free (MSG_FREE_DATA) - send in response to "data" message to deallocate
- *       the buffer.
- *
- * Endpoint bounding process:
- *
- *     The bounding process is symmetric - both sides are the same. Endpoint addresses may
- *     be different on each side, so each side must know both local and remote address.
- *     Bounding processes is done in two parallel jobs:
- *     1) Informing remote site about local address and name.
- *        * Local side sends "Endpoint bound" message with local address and name.
- *        * Local side waits for deallocation of above message to confirm that it was
- *          successfully processed by the remote side.
- *     2) Getting remote address of the endpoint.
- *        * Local side waits for the "Endpoint bound" message.
- *        * It associates remote address with local endpoint
- *        * It sends "Endpoint bound free" to deallocate the above message and inform
- *          that it was successfully processed.
- *     When those two jobs complete, the endpoint is bounded, callback is called and
- *     the endpoint is ready to transfer data.
- */
 
 enum ept_bounding_state {
 	EPT_UNCONFIGURED = 0,	/* Endpoint in not configured (initial state). */
 	EPT_CONFIGURED,		/* Endpoint is configured, waiting for work queue to send
 				 * bound message. */
-	EPT_BOUNDING,		/* Bound message was send, waiting for bound deallocation
+	EPT_BOUNDING,		/* Bound message was send, waiting for bound release
 				 * message which works as bounding ACK. */
-	EPT_BOUNDED,		/* Bound message deallocation was received, waiting for
+	EPT_BOUNDED,		/* Release bound message was received, waiting for
 				 * incoming bound message or (if already received)
 				 * for work queue to call the user bound callback. */
-	EPT_READY,		/* Endpoint is bounded, ready to exchange messages. */
+	EPT_READY,		/* Endpoint is bounded, ready to exchange data. */
 };
 
 struct channel_config {
-	uint8_t *blocks_ptr;
-	size_t block_size;
-	size_t block_count;
+	uint8_t *blocks_ptr;	/**< Address where the blocks start. */
+	size_t block_size;	/**< Size of one block. */
+	size_t block_count;	/**< Number of blocks. */
 };
 
 struct icmsg_with_buf_config {
-	struct icmsg_config_t icmsg_config;
-	struct channel_config rx;
-	struct channel_config tx;
-	sys_bitarray_t *tx_usage_bitmap;
-	sys_bitarray_t *rx_hold_bitmap;
+	struct icmsg_config_t icmsg_config;	/**< Configuration of the ICmsg. */
+	struct channel_config rx;		/**< RX channel config. */
+	struct channel_config tx;		/**< RX channel config. */
+	sys_bitarray_t *tx_usage_bitmap;	/**< Bit is set when TX block is in use */
+	sys_bitarray_t *rx_hold_bitmap;		/**< Bit is set is buffer starting at this
+						     block should be kept after exit from
+						     receive handler. */
 };
 
 struct ept_data {
-	const struct ipc_ept_cfg *cfg;
-	uint8_t local_addr;
-	uint8_t remote_addr;
-	enum ept_bounding_state state;
+	const struct ipc_ept_cfg *cfg;	/**< Endpoint configuration. */
+	uint8_t local_addr;		/**< Local endpoint address. Equals index in
+					 *   endpoints array. */
+	uint8_t remote_addr;		/**< Remote endpoint address. Obtained during the
+					 *   bounding process. */
+	enum ept_bounding_state state;	/**< Bounding state. */
 };
 
 struct backend_data {
-	const struct icmsg_with_buf_config* conf;
-	struct icmsg_data_t icmsg_data;
-	struct k_mutex mutex;
-	struct k_work ep_bound_work;
-	struct k_sem block_wait_sem;
+	const struct icmsg_with_buf_config* conf; /**< Backend instance config. */
+	struct icmsg_data_t icmsg_data;	/**< ICmsg data. */
+	struct k_mutex mutex;		/**< Mutex to protect common data and resources.*/
+	struct k_work ep_bound_work;	/**< Work item for bounding processing. */
+	struct k_sem block_wait_sem;	/**< Semaphore for waiting for free blocks. */
 	struct ept_data ept[CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP];
+					/**< Array of registered endpoints. */
 	uint16_t waiting_bound_msg[CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP];
-	uint8_t ept_count;
-	bool icmsg_bounded;
+					/**< Array of "bound" messages waiting to be
+					 *   registered locally. */
+	uint8_t ept_count;		/**< Number of registered endpoints. */
+	bool icmsg_bounded;		/**< ISmsg was bounded already. */
 };
 
 struct block_header {
-	size_t size;
-	uint8_t data[];
+	size_t size;	/**< Size of the data field. */
+	uint8_t data[];	/**< Buffer data. */
 };
 
 struct ept_bound_msg {
-	uint8_t ept_addr;
-	char name[];
+	uint8_t ept_addr;	/**< Sender address of the endpoint. */
+	char name[];		/**< Name of the endpoint. */
 };
 
 BUILD_ASSERT(CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP <= EPT_ADDR_MAX + 1,
 	     "Too many endpoints");
 
-static struct block_header *block_from_index(const struct channel_config *ch_conf, size_t block_index)
+/**
+ * Calculate pointer to block from its index and channel configuration (RX or TX).
+ * No validation is performed.
+ */
+static struct block_header *block_from_index(const struct channel_config *ch_conf,
+					     size_t block_index)
 {
-	return (struct block_header *)(ch_conf->blocks_ptr + block_index * ch_conf->block_size);
+	return (struct block_header *)(ch_conf->blocks_ptr + block_index *
+				       ch_conf->block_size);
 }
 
-static uint8_t *buffer_from_index_validate(const struct channel_config *ch_conf, size_t block_index, size_t *size, bool invalidate_cache)
+/**
+ * Calculate pointer to data buffer from block index and channel configuration (RX or TX).
+ * Also validate the index and optionally the buffer size allocated on the this block.
+ *
+ * @param[in]  ch_conf		The channel
+ * @param[in]  block_index	Block index
+ * @param[out] size		Size of the buffer allocated on the block if not NULL.
+ *				The size is also checked if it fits in the blocks area.
+ *				If it is NULL, no size validation is performed.
+ * @param[in]  invalidate_cache	If size is not NULL, invalidates cache for entire buffer
+ *				(all blocks). Otherwise, it is ignored.
+ * @return	Pointer to data buffer or NULL if validation failed.
+ */
+static uint8_t *buffer_from_index_validate(const struct channel_config *ch_conf,
+					   size_t block_index, size_t *size,
+					   bool invalidate_cache)
 {
-	PUSH;
+
 	size_t allocable_size;
 	size_t buffer_size;
 	uint8_t *end_ptr;
@@ -203,8 +203,6 @@ static uint8_t *buffer_from_index_validate(const struct channel_config *ch_conf,
 
 	if (block_index >= ch_conf->block_count) {
 		LOG_ERR("Pointer invalid");
-		SHOW("Pointer invalid\n");
-		POP;
 		return NULL;
 	}
 
@@ -216,9 +214,9 @@ static uint8_t *buffer_from_index_validate(const struct channel_config *ch_conf,
 			__sync_synchronize();
 		}
 		buffer_size = block->size;
-		if (buffer_size > allocable_size - offsetof(struct block_header, data) || &block->data[buffer_size] > end_ptr) {
+		if (buffer_size > allocable_size - offsetof(struct block_header, data) ||
+		    &block->data[buffer_size] > end_ptr) {
 			LOG_ERR("Block corrupted");
-			POP;
 			return NULL;
 		}
 		*size = buffer_size;
@@ -228,12 +226,22 @@ static uint8_t *buffer_from_index_validate(const struct channel_config *ch_conf,
 		}
 	}
 
-	POP;
 	return block->data;
 }
 
+/**
+ * Calculate block index based on data buffer pointer and validate it.
+ *
+ * @param[in]  ch_conf		The channel
+ * @param[in]  buffer		Pointer to data buffer
+ * @param[out] size		Size of the allocated buffer if not NULL.
+ *				The size is also checked if it fits in the blocks area.
+ *				If it is NULL, no size validation is performed.
+ * @return		Block index or negative error code
+ * @retval -EINVAL	The buffer is not correct
+ */
 static int buffer_to_index_validate(const struct channel_config *ch_conf, const uint8_t *buffer, size_t *size)
-{PUSH;
+{
 	size_t block_index;
 	uint8_t *expected;
 
@@ -243,12 +251,9 @@ static int buffer_to_index_validate(const struct channel_config *ch_conf, const 
 
 	if (expected == NULL || expected != buffer) {
 		LOG_ERR("Pointer invalid");
-		SHOW("Pointer invalid\n");
-		POP;
 		return -EINVAL;
 	}
 
-	POP;
 	return block_index;
 }
 
@@ -256,32 +261,11 @@ static int buffer_to_index_validate(const struct channel_config *ch_conf, const 
  * Send data with ICmsg with mutex locked. Mutex must be locked because ICmsg may return
  * error on concurrent invocations even when there is enough space in queue.
  */
-static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg_type, uint8_t block_index)
-{PUSH;
+static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg_type, uint8_t tx_block_index)
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
-	uint8_t message[2] = { addr_or_msg_type, block_index };
-	uint8_t *buffer;
-	size_t size;
+	uint8_t message[2] = { addr_or_msg_type, tx_block_index };
 	int r;
-
-	switch (addr_or_msg_type) {
-	case MSG_FREE_DATA:
-		buffer = buffer_from_index_validate(&dev_data->conf->rx, block_index, &size, false);
-		printk1(">>> Free Data @%d, size=%d\n", block_index, size);
-		break;
-	case MSG_FREE_BOUND_EPT:
-		buffer = buffer_from_index_validate(&dev_data->conf->rx, block_index, NULL, false);
-		printk1(">>> Free Bound Msg @%d, rem_addr=%d, name=%s\n", block_index, buffer ? buffer[0] : -1, buffer ? (char*)&buffer[1] : "?");
-		break;
-	case MSG_BOUND_EPT:
-		buffer = buffer_from_index_validate(&dev_data->conf->tx, block_index, NULL, false);
-		printk1(">>> Bound Msg @%d, loc_addr=%d, name=%s\n", block_index, buffer ? buffer[0] : -1, buffer ? (char*)&buffer[1] : "?");
-		break;
-	default:
-		buffer = buffer_from_index_validate(&dev_data->conf->tx, block_index, &size, false);
-		printk1(">>> Data @%d, rem_addr=%d, size=%d\n", block_index, addr_or_msg_type, size);
-		break;
-	}
 
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
 	r = icmsg_send(&conf->icmsg_config, &dev_data->icmsg_data, message,
@@ -290,7 +274,6 @@ static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg
 	if (r < 0) {
 		LOG_ERR("Cannot send over ICmsg, error: %d", r);
 	}
-	POP;
 	return r;
 }
 
@@ -298,8 +281,8 @@ static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg
  * Allocate buffer for transmission
  *
  * @param[in] dev_data	Device data
- * @param[in] size	Required size of the buffer. If zero, first free block is
- * 			allocated and all subsequent free blocks.
+ * @param[in] size	Required size of the buffer. If zero, first available block is
+ * 			allocated and all subsequent available blocks.
  * @param[out] block	First allocated block. Block header contains actually allocated
  * 			bytes, so it have to be adjusted before sending.
  * @param[in] timeout	Timeout
@@ -311,7 +294,7 @@ static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg
  */
 static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
 			   uint8_t **buffer, k_timeout_t timeout)
-{PUSH;
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	size_t total_size = size + offsetof(struct block_header, data);
 	size_t num_blocks = (total_size + conf->tx.block_size - 1) / conf->tx.block_size;
@@ -326,7 +309,7 @@ static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
 		/* Try to allocate specified number of blocks */
 		r = sys_bitarray_alloc(conf->tx_usage_bitmap, num_blocks, &tx_block_index);
 		if (r == -ENOSPC && !K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
-			/* Wait for deallocation if there is no enough space and exit loop
+			/* Wait for releasing if there is no enough space and exit loop
 			 * on timeout */
 			r = k_sem_take(&dev_data->block_wait_sem, timeout);
 			if (r < 0) {
@@ -349,7 +332,6 @@ static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
 		if (r != -ENOSPC && r != EAGAIN) {
 			LOG_ERR("Failed to allocate buffer, error: %d", r);
 		}
-		POP;
 		return r;
 	}
 
@@ -378,77 +360,67 @@ static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
 		*buffer = block->data;
 	}
 
-	POP;
 	return tx_block_index;
 }
 
 /**
- * Free all or part of the blocks occupied by the buffer.
+ * Release all or part of the blocks occupied by the buffer.
  *
- * @param[in] dev_data	Device data
- * @param[in] buffer	Buffer to free
- * @param[in] new_size	If less than zero, free all blocks, otherwise reduce size to this
- *			value and update size in block header.
+ * @param[in] dev_data		Device data
+ * @param[in] tx_block_index	First block index to release, no validation is performed,
+ *				so caller is responsible for passing valid index.
+ * @param[in] size		Size of data buffer, no validation is performed,
+ *				so caller is responsible for passing valid size.
+ * @param[in] new_size		If less than zero, release all blocks, otherwise reduce
+ *				size to this value and update size in block header.
  *
  * @returns		Positive block index where the buffer starts or negative error
  * @retval -EINVAL	If invalid buffer was provided or size is greater than already
  *			allocated size.
  */
-static int free_tx_buffer(struct backend_data *dev_data, const uint8_t *buffer,
-			  int new_size)
-{PUSH;
+static int release_tx_blocks(struct backend_data *dev_data, size_t tx_block_index,
+			     size_t size, int new_size)
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	struct block_header *block;
-	size_t size;
 	size_t num_blocks;
 	size_t total_size;
 	size_t new_total_size;
 	size_t new_num_blocks;
-	size_t block_free_index;
-	size_t block_index;
+	size_t release_index;
 	int r;
-
-	r = buffer_to_index_validate(&conf->tx, buffer, &size);
-	if (r < 0) {
-		POP;
-		return r;
-	}
-
-	block_index = r;
 
 	/* Calculate number of blocks. */
 	total_size = size + offsetof(struct block_header, data);
 	num_blocks = (total_size + conf->tx.block_size - 1) / conf->tx.block_size;
 
 	if (new_size >= 0) {
-		/* Calculate and validate new values */
+		/* Calculate and validate new values. */
 		new_total_size = new_size + offsetof(struct block_header, data);
 		new_num_blocks = (new_total_size + conf->tx.block_size - 1) /
 				 conf->tx.block_size;
 		if (new_num_blocks > num_blocks) {
 			LOG_ERR("Requested size bigger than allocated");
 			__ASSERT_NO_MSG(false);
-			POP;
 			return -EINVAL;
 		}
-		/* Update actual buffer size and blocks to deallocate */
-		block = block_from_index(&conf->tx, block_index);
+		/* Update actual buffer size and number of block to release. */
+		block = block_from_index(&conf->tx, tx_block_index);
 		block->size = new_size;
-		block_free_index = block_index + new_num_blocks;
+		release_index = tx_block_index + new_num_blocks;
 		num_blocks = num_blocks - new_num_blocks;
 	} else {
-		/* If size is negative, free all blocks */
-		block_free_index = block_index;
+		/* If size is negative, release all blocks. */
+		release_index = tx_block_index;
 	}
 
 	if (num_blocks > 0) {
 		/* Free bits in the bitmap */
 		r = sys_bitarray_free(conf->tx_usage_bitmap, num_blocks,
-				      block_free_index);
+				      release_index);
 		if (r < 0) {
 			LOG_ERR("Cannot free bits");
 			__ASSERT_NO_MSG(false);
-			POP;
 			return r;
 		}
 
@@ -456,10 +428,35 @@ static int free_tx_buffer(struct backend_data *dev_data, const uint8_t *buffer,
 		k_sem_give(&dev_data->block_wait_sem);
 	}
 
-	POP;
-	return block_index;
+	return tx_block_index;
 }
 
+/**
+ * Release all or part of the blocks occupied by the buffer.
+ *
+ * @param[in] dev_data	Device data
+ * @param[in] buffer	Buffer to release
+ * @param[in] new_size	If less than zero, release all blocks, otherwise reduce size to this
+ *			value and update size in block header.
+ *
+ * @returns		Positive block index where the buffer starts or negative error
+ * @retval -EINVAL	If invalid buffer was provided or size is greater than already
+ *			allocated size.
+ */
+static int release_tx_buffer(struct backend_data *dev_data, const uint8_t *buffer,
+			     int new_size)
+{
+	const struct icmsg_with_buf_config *conf = dev_data->conf;
+	size_t size;
+	int r;
+
+	r = buffer_to_index_validate(&conf->tx, buffer, &size);
+	if (r < 0) {
+		return r;
+	}
+
+	return release_tx_blocks(dev_data, r, size, new_size);
+}
 /**
  * Put endpoint bound processing into system workqueue.
  *
@@ -472,7 +469,7 @@ static void schedule_ept_bound_process(struct backend_data *dev_data)
 
 /**
  * Find endpoint that was registered with name that matches name
- * contained in the endpoint registration buffer received from remote. This function
+ * contained in the endpoint bound message received from remote. This function
  * must be called when mutex is locked.
  * 
  * @param[in] dev_data	Device data.
@@ -481,12 +478,12 @@ static void schedule_ept_bound_process(struct backend_data *dev_data)
  * @return	Found endpoint data or NULL if not found
  */
 static struct ept_data *find_ept_by_name(struct backend_data *dev_data, const char *name)
-{PUSH;
+{
 	const struct channel_config *rx_conf = &dev_data->conf->rx;
-	int i;
 	const char *buffer_end = (const char *)rx_conf->blocks_ptr +
 				 rx_conf->block_count * rx_conf->block_size;
 	size_t name_size;
+	size_t i;
 
 	/* Requested name is in shared memory, so we have to assume that it
 	 * can be corrupted. Extra care must be taken to avoid out of
@@ -495,63 +492,59 @@ static struct ept_data *find_ept_by_name(struct backend_data *dev_data, const ch
 
 	for (i = 0; i < dev_data->ept_count; i++) {
 		if (strncmp(dev_data->ept[i].cfg->name, name, name_size) == 0) {
-			POP;
 			return &dev_data->ept[i];
 		}
 	}
-	POP;
 	return NULL;
 }
 
 /**
- * Request deallocation of receive buffer. This function will just sends buffer
- * deallocation message over ICMsg.
+ * Release received buffer. This function will just sends release message over ICMsg.
  * 
  * @param[in] dev_data	Device data
- * @param[in] buffer	Buffer to deallocate
+ * @param[in] buffer	Buffer to release
+ * @param[in] msg_type	Message type: MSG_RELEASE_BOUND_EPT or MSG_RELEASE_DATA
  * 
  * @return	zero or ICMsg send error
  */
-static int free_rx_buffer(struct backend_data *dev_data, const uint8_t *buffer, uint8_t msg_type)
-{PUSH;
+static int send_release(struct backend_data *dev_data, const uint8_t *buffer, uint8_t msg_type)
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
-	int block_index;
+	int tx_block_index;
 
-	block_index = buffer_to_index_validate(&conf->rx, buffer, NULL);
-	if (block_index < 0) {
-		POP;
-		return block_index;
+	tx_block_index = buffer_to_index_validate(&conf->rx, buffer, NULL);
+	if (tx_block_index < 0) {
+		return tx_block_index;
 	}
 
-	SHOW("free_rx_buffer msg 0x%0X bl %d\n", msg_type, block_index);
-
-	POP;
-	return icmsg_send_wrapper(dev_data, msg_type, block_index);
+	return icmsg_send_wrapper(dev_data, msg_type, tx_block_index);
 }
 
-static int received_free_reg_ept(struct backend_data *dev_data, size_t tx_block_index)
-{PUSH;
+/**
+ * Release bound endpoint message received.
+ */
+static int received_release_bound_ept(struct backend_data *dev_data, size_t tx_block_index)
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	uint8_t *buffer;
 	struct ept_bound_msg *msg;
 	size_t local_addr;
+	size_t size;
 	int r = 0;
 
-	buffer = buffer_from_index_validate(&conf->tx, tx_block_index, NULL, false);
+	buffer = buffer_from_index_validate(&conf->tx, tx_block_index, &size, false);
 	if (buffer == NULL) {
-		POP;
 		return -EINVAL;
 	}
 
 	msg = (struct ept_bound_msg *)buffer;
 	local_addr = msg->ept_addr;
 
-	r = free_tx_buffer(dev_data, buffer, -1);
+	r = release_tx_blocks(dev_data, tx_block_index, size, -1);
 
 	if (local_addr >= CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP) {
-		LOG_ERR("Cannot free bits");
+		LOG_ERR("Invalid ept address");
 		__ASSERT_NO_MSG(false);
-		POP;
 		return -EINVAL;
 	}
 
@@ -559,45 +552,44 @@ static int received_free_reg_ept(struct backend_data *dev_data, size_t tx_block_
 	dev_data->ept[local_addr].state = EPT_BOUNDED;
 	k_mutex_unlock(&dev_data->mutex);
 
-	SHOW("received_free_reg_ept - schedule_ept_bound_process %d ep %d bl %d\n", r, local_addr, tx_block_index);
-
-	while (r < 0);
-
 	schedule_ept_bound_process(dev_data);
 
-	POP;
 	return r;
 }
 
-static int received_free_data(struct backend_data *dev_data, size_t tx_block_index)
-{PUSH;
+/**
+ * Release data message received.
+ */
+static int received_release_data(struct backend_data *dev_data, size_t tx_block_index)
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	uint8_t *buffer;
+	size_t size;
 
-	buffer = buffer_from_index_validate(&conf->tx, tx_block_index, NULL, false);
+	buffer = buffer_from_index_validate(&conf->tx, tx_block_index, &size, false);
 	if (buffer == NULL) {
-		POP;
 		return -EINVAL;
 	}
 
-	POP;
-	return free_tx_buffer(dev_data, buffer, -1);
+	return release_tx_blocks(dev_data, tx_block_index, size, -1);
 }
 
-static int received_register_ept(struct backend_data *dev_data, size_t rx_block_index)
-{PUSH;
+/**
+ * Bound endpoint message received.
+ */
+static int received_bound_ept(struct backend_data *dev_data, size_t rx_block_index)
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	size_t size;
 	uint8_t *buffer;
 	bool is_bounded;
-	int i;
+	size_t i;
 	int r = -ENOMEM;
 
 	buffer = buffer_from_index_validate(&conf->rx, rx_block_index, &size, true);
 	if (buffer == NULL) {
 		LOG_ERR("Received invalid block index: %d", rx_block_index);
 		__ASSERT_NO_MSG(false);
-		POP;
 		return -EINVAL;
 	}
 
@@ -618,7 +610,6 @@ static int received_register_ept(struct backend_data *dev_data, size_t rx_block_
 
 	/* If ICmsg is already bounded, schedule processing the message */
 	if (is_bounded) {
-		printk2("received_register_ept - schedule_ept_bound_process %d\n", r);
 		schedule_ept_bound_process(dev_data);
 	}
 
@@ -627,12 +618,14 @@ static int received_register_ept(struct backend_data *dev_data, size_t rx_block_
 		__ASSERT_NO_MSG(false);
 	}
 
-	POP;
 	return r;
 }
 
+/**
+ * Data message received.
+ */
 static int received_data(struct backend_data *dev_data, size_t rx_block_index, int local_addr)
-{PUSH;
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	uint8_t *buffer;
 	struct ept_data *ept;
@@ -646,7 +639,6 @@ static int received_data(struct backend_data *dev_data, size_t rx_block_index, i
 	    local_addr >= CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP) {
 		LOG_ERR("Received invalid block index: %d", rx_block_index);
 		__ASSERT_NO_MSG(false);
-		POP;
 		return -EINVAL;
 	}
 
@@ -657,18 +649,17 @@ static int received_data(struct backend_data *dev_data, size_t rx_block_index, i
 	ept = &dev_data->ept[local_addr];
 	ept->cfg->cb.received(buffer, size, ept->cfg->priv);
 
-	/* If the bit is still cleared, request deallocation of the buffer. */
+	/* If the bit is still cleared, request release of the buffer. */
 	sys_bitarray_test_bit(conf->rx_hold_bitmap, rx_block_index, &bit_val);
 	if (!bit_val) {
-		free_rx_buffer(dev_data, buffer, MSG_FREE_DATA);
+		send_release(dev_data, buffer, MSG_RELEASE_DATA);
 	}
 
-	POP;
 	return r;
 }
 
 /**
- * Callback called by ICMsg that handles message (data or ept registration) received
+ * Callback called by ICMsg that handles message (data or endpoint bound) received
  * from the remote.
  *
  * @param[in] data	Message received from the ICMsg
@@ -676,14 +667,12 @@ static int received_data(struct backend_data *dev_data, size_t rx_block_index, i
  * @param[in] priv	Opaque pointer to device instance
  */
 static void received(const void *data, size_t len, void *priv)
-{PUSH;
+{
 	const struct device *instance = priv;
 	struct backend_data *dev_data = instance->data;
 	const uint8_t *message = (const uint8_t *)data;
 	size_t addr_or_msg_type;
 	size_t block_index = 0;
-	size_t size;
-	uint8_t *buffer;
 	int r;
 
 	if (len != 2) {
@@ -695,33 +684,14 @@ static void received(const void *data, size_t len, void *priv)
 	block_index = message[1];
 
 	switch (addr_or_msg_type) {
-	case MSG_FREE_DATA:
-		buffer = buffer_from_index_validate(&dev_data->conf->tx, block_index, &size, false);
-		printk1("<<< Free Data @%d, size=%d\n", block_index, size);
+	case MSG_RELEASE_BOUND_EPT:
+		r = received_release_bound_ept(dev_data, block_index);
 		break;
-	case MSG_FREE_BOUND_EPT:
-		buffer = buffer_from_index_validate(&dev_data->conf->tx, block_index, NULL, false);
-		printk1("<<< Free Bound Msg @%d, loc_addr=%d, name=%s\n", block_index, buffer ? buffer[0] : -1, buffer ? (char*)&buffer[1] : "?");
+	case MSG_RELEASE_DATA:
+		r = received_release_data(dev_data, block_index);
 		break;
 	case MSG_BOUND_EPT:
-		buffer = buffer_from_index_validate(&dev_data->conf->rx, block_index, &size, true);
-		printk1("<<< Bound Msg @%d, rem_addr=%d, name=%s\n", block_index, buffer ? buffer[0] : -1, buffer ? (char*)&buffer[1] : "?");
-		break;
-	default:
-		buffer = buffer_from_index_validate(&dev_data->conf->rx, block_index, &size, true);
-		printk1("<<< Data @%d, loc_addr=%d, size=%d\n", block_index, addr_or_msg_type, size);
-		break;
-	}
-
-	switch (addr_or_msg_type) {
-	case MSG_FREE_BOUND_EPT:
-		r = received_free_reg_ept(dev_data, block_index);
-		break;
-	case MSG_FREE_DATA:
-		r = received_free_data(dev_data, block_index);
-		break;
-	case MSG_BOUND_EPT:
-		r = received_register_ept(dev_data, block_index);
+		r = received_bound_ept(dev_data, block_index);
 		break;
 	default:
 		r = received_data(dev_data, block_index, addr_or_msg_type);
@@ -733,47 +703,57 @@ exit:
 		LOG_ERR("Failed to receive, error %d", r);
 		__ASSERT_NO_MSG(false);
 	}
-	POP;
 }
 
 /**
  * Callback called when ICMsg is bound.
  */
 static void bound(void *priv)
-{PUSH;
+{
 	const struct device *instance = priv;
 	struct backend_data *dev_data = instance->data;
-
-	printk2("ICmsg bounded\n");
 
 	/* Set flag that ICMsg is bounded and now, endpoint bounding may start. */
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
 	dev_data->icmsg_bounded = true;
 	k_mutex_unlock(&dev_data->mutex);
-	printk2("bound - schedule_ept_bound_process\n");
 	schedule_ept_bound_process(dev_data);
-	POP;
 }
 
+/**
+ * Send data contained in specified block. It will adjust data size and flush cache
+ * if necessary.
+ *
+ * @param[in] tx_block_index	Index of first block containing data, it is not validated,
+ *				so caller is responsible for passing only valid index.
+ * @param[in] size			Actual size of the data, can be smaller than allocated
+ * @param[in] remote_addr		Remote endpoints address
+ *
+ * @return			O or negative error code
+ */
 static int send_block(struct backend_data *dev_data, size_t tx_block_index, size_t size, uint8_t remote_addr)
-{PUSH;
+{
 	struct block_header *block = block_from_index(&dev_data->conf->tx, tx_block_index);
 
 	block->size = size;
 	__sync_synchronize();
 	sys_cache_data_flush_range(block, size + offsetof(struct block_header, data));
-	POP;
 	return icmsg_send_wrapper(dev_data, remote_addr, tx_block_index);
 }
 
+/**
+ * Send bound message on specified endpoint.
+ *
+ * @param[in] ept	Endpoint to send
+ *
+ * @return		O or negative error code
+ */
 static int send_bound_message(struct backend_data *dev_data, struct ept_data *ept)
-{PUSH;
+{
 	size_t msg_len;
 	uint8_t *buffer;
 	struct ept_bound_msg *msg;
 	int r;
-
-	printk2("bound message send\n");
 
 	msg_len = offsetof(struct ept_bound_msg, name) + strlen(ept->cfg->name) + 1;
 	r = alloc_tx_buffer(dev_data, msg_len, &buffer, K_FOREVER);
@@ -789,12 +769,22 @@ static int send_bound_message(struct backend_data *dev_data, struct ept_data *ep
 		__ASSERT_NO_MSG(false);
 	}
 
-	POP;
 	return r;
 }
 
-static int match_bound_msg(struct backend_data *dev_data, size_t rx_block_index) // TODO: reconsider adding rx/tx prefix in other paces
-{PUSH;
+/**
+ * Find registered endpoint that matches given "bound endpoint" message. When found,
+ * remote endpoint address is saved for future use and "release bound endpoint" message
+ * is send.
+ *
+ * @param[in] rx_block_index	Block containing the "bound endpoint" message.
+ *
+ * @retval 0	match not found
+ * @retval 1	match found and processing was successful
+ * @retval < 0	error occurred during processing
+ */
+static int match_bound_msg(struct backend_data *dev_data, size_t rx_block_index)
+{
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	uint8_t *buffer;
 	uint8_t remote_addr;
@@ -809,36 +799,31 @@ static int match_bound_msg(struct backend_data *dev_data, size_t rx_block_index)
 	ept = find_ept_by_name(dev_data, msg->name);
 
 	if (ept == NULL) {
-		POP;
 		return 0;
 	}
 
 	ept->remote_addr = remote_addr;
 
-	printk2("Remote %d bounded with local %d\n", remote_addr, ept->local_addr);
-
 	k_mutex_unlock(&dev_data->mutex);
-	r = free_rx_buffer(dev_data, buffer, MSG_FREE_BOUND_EPT);
+	r = send_release(dev_data, buffer, MSG_RELEASE_BOUND_EPT);
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
 
 	if (r < 0) {
-		POP;
 		return r;
 	}
 
-	POP;
 	return 1;
 }
 
 /**
  * Work handler that is responsible for bounding the endpoints. It sends endpoint
- * registration requests to the remote and calls local endpoint bound callback.
+ * bound message to the remote and calls local endpoint bound callback.
  */
 static void ep_bound_process(struct k_work *item)
-{PUSH;
+{
 	struct backend_data *dev_data = CONTAINER_OF(item, struct backend_data, ep_bound_work);
 	struct ept_data *ept = NULL;
-	int i;
+	size_t i;
 	int r = 0;
 
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
@@ -847,8 +832,6 @@ static void ep_bound_process(struct k_work *item)
 	if (!dev_data->icmsg_bounded) {
 		goto exit;
 	}
-
-	printk2("ep_bound_process\n");
 
 	/* Walk over all waiting incoming bound messages and match to local endpoints. */
 	for (i = 0; i < CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP; i++) {
@@ -888,30 +871,25 @@ static void ep_bound_process(struct k_work *item)
 exit:
 	k_mutex_unlock(&dev_data->mutex);
 	if (r < 0) {
-		printk2("schedule_ept_bound_process %d\n", r);
 		schedule_ept_bound_process(dev_data);
 		LOG_ERR("Failed to process bounding, error %d", r);
 		__ASSERT_NO_MSG(false);
 	}
-	POP;
 }
 
 /**
  * Backend device initialization.
  */
 static int backend_init(const struct device *instance)
-{PUSH;
+{
 	const struct icmsg_with_buf_config *conf = instance->config;
 	struct backend_data *dev_data = instance->data;
-
-	printk2("Backend initialization\n");
 
 	dev_data->conf = conf;
 	k_mutex_init(&dev_data->mutex);
 	k_work_init(&dev_data->ep_bound_work, ep_bound_process);
 	k_sem_init(&dev_data->block_wait_sem, 0, 1);
 	memset(&dev_data->waiting_bound_msg, 0xFF, sizeof(dev_data->waiting_bound_msg));
-	POP;
 	return 0;
 }
 
@@ -919,7 +897,7 @@ static int backend_init(const struct device *instance)
  * Open the backend instance callback.
  */
 static int open(const struct device *instance)
-{PUSH;
+{
 	const struct icmsg_with_buf_config *conf = instance->config;
 	struct backend_data *dev_data = instance->data;
 
@@ -947,7 +925,6 @@ static int open(const struct device *instance)
 		(uint32_t)conf->rx.blocks_ptr,
 		(uint32_t)(conf->rx.block_size * conf->tx.block_count -
 			   offsetof(struct block_header, data)));
-	POP;
 	return icmsg_open(&conf->icmsg_config, &dev_data->icmsg_data, &cb, (void *)instance);
 }
 
@@ -956,7 +933,7 @@ static int open(const struct device *instance)
  */
 static int register_ept(const struct device *instance, void **token,
 			const struct ipc_ept_cfg *cfg)
-{PUSH;
+{
 	struct backend_data *dev_data = instance->data;
 	struct ept_data *ept = NULL;
 	int r = 0;
@@ -971,10 +948,9 @@ static int register_ept(const struct device *instance, void **token,
 		ept->remote_addr = EPT_ADDR_INVALID;
 		ept->state = EPT_CONFIGURED;
 		dev_data->ept_count++;
-		printk1("EP %d: %s\n", ept->local_addr, ept->cfg->name);
 	} else {
 		r = -ENOMEM;
-		LOG_ERR("Too many endpoints registered");
+		LOG_ERR("Too many endpoints");
 		__ASSERT_NO_MSG(false);
 	}
 
@@ -983,33 +959,25 @@ static int register_ept(const struct device *instance, void **token,
 	/* Keep endpoint address in token. */
 	*token = ept;
 
-	printk2("Register EP %d\n", r);
-
 	/* Rest of the bounding will be done in the system workqueue. */
-	printk2("register_ept - schedule_ept_bound_process %d\n", r);
 	schedule_ept_bound_process(dev_data);
 
-	printk2("return %d\n", r);
-
-	POP;
 	return r;
 }
 
 /**
  * Endpoint send callback function (with copy).
  */
-static int send(const struct device *instance, void *token,
-		const void *msg, size_t len)
-{PUSH;
+static int send(const struct device *instance, void *token, const void *msg, size_t len)
+{
 	struct backend_data *dev_data = instance->data;
 	struct ept_data *ept = token;
 	uint8_t *buffer;
-	int r; // TODO: reconsider naming return values that holds actual data
+	int r;
 
 	/* Allocate the buffer. */
 	r = alloc_tx_buffer(dev_data, len, &buffer, K_FOREVER);
 	if (r < 0) {
-		POP;
 		return r;
 	}
 
@@ -1021,18 +989,17 @@ static int send(const struct device *instance, void *token,
 
 	/* Remove buffer if something gone wrong - buffer was not send */
 	if (r < 0) {
-		free_tx_buffer(dev_data, buffer, -1);
+		release_tx_buffer(dev_data, buffer, -1);
 	}
 
-	POP;
 	return r;
 }
 
 /**
  * Endpoint TX buffer allocation callback for nocopy sending.
  */
-static int get_tx_buffer(const struct device *instance, void *token,
-			 void **data, uint32_t *user_len, k_timeout_t wait)
+static int get_tx_buffer(const struct device *instance, void *token, void **data,
+			 uint32_t *user_len, k_timeout_t wait)
 {
 	struct backend_data *dev_data = instance->data;
 	struct block_header *block;
@@ -1049,32 +1016,29 @@ static int get_tx_buffer(const struct device *instance, void *token,
 }
 
 /**
- * Endpoint TX buffer deallocation callback for nocopy sending.
+ * Endpoint TX buffer release callback for nocopy sending.
  */
-static int drop_tx_buffer(const struct device *instance, void *token,
-			  const void *data)
-{PUSH;
+static int drop_tx_buffer(const struct device *instance, void *token, const void *data)
+{
 	struct backend_data *dev_data = instance->data;
 
-	POP;
-	return free_tx_buffer(dev_data, data, -1);
+	return release_tx_buffer(dev_data, data, -1);
 }
 
 /**
  * Endpoint nocopy sending.
  */
-static int send_nocopy(const struct device *instance, void *token,
-			const void *data, size_t len)
-{PUSH;
+static int send_nocopy(const struct device *instance, void *token, const void *data,
+		       size_t len)
+{
 	struct backend_data *dev_data = instance->data;
 	struct ept_data *ept = token;
 	int r;
 
 	/* Actual size may be smaller than requested, so shrink if possible. */
-	r = free_tx_buffer(dev_data, data, len);
+	r = release_tx_buffer(dev_data, data, len);
 	if (r < 0) {
-		free_tx_buffer(dev_data, data, -1);
-		POP;
+		release_tx_buffer(dev_data, data, -1);
 		return r;
 	}
 
@@ -1082,10 +1046,9 @@ static int send_nocopy(const struct device *instance, void *token,
 
 	/* Remove buffer if something gone wrong - buffer was not send */
 	if (r < 0) {
-		free_tx_buffer(dev_data, data, -1);
+		release_tx_buffer(dev_data, data, -1);
 	}
 
-	POP;
 	return r;
 }
 
@@ -1093,40 +1056,36 @@ static int send_nocopy(const struct device *instance, void *token,
  * Holding RX buffer for nocopy receiving.
  */
 static int hold_rx_buffer(const struct device *instance, void *token, void *data)
-{PUSH;
+{
 	const struct icmsg_with_buf_config *conf = instance->config;
-	int block_index;
+	int rx_block_index;
 	uint8_t *buffer = data;
 
 	/* Calculate block index and set associated bit. */
-	block_index = buffer_to_index_validate(&conf->rx, buffer, NULL);
-	if (block_index < 0) {
-		POP;
-		return block_index;
+	rx_block_index = buffer_to_index_validate(&conf->rx, buffer, NULL);
+	if (rx_block_index < 0) {
+		return rx_block_index;
 	}
-	POP;
-	return sys_bitarray_set_bit(conf->rx_hold_bitmap, block_index);
+	return sys_bitarray_set_bit(conf->rx_hold_bitmap, rx_block_index);
 }
 
 /**
  * Release RX buffer that was previously held.
  */
 static int release_rx_buffer(const struct device *instance, void *token, void *data)
-{PUSH;
+{
 	struct backend_data *dev_data = instance->data;
 
-	POP;
-	return free_rx_buffer(dev_data, (uint8_t *)data, MSG_FREE_DATA);
+	return send_release(dev_data, (uint8_t *)data, MSG_RELEASE_DATA);
 }
 
 /**
  * Returns maximum TX buffer size.
  */
 static int get_tx_buffer_size(const struct device *instance, void *token)
-{PUSH;
+{
 	const struct icmsg_with_buf_config *conf = instance->config;
 
-	POP;
 	return (conf->tx.block_size * conf->tx.block_count -
 		offsetof(struct block_header, data));
 }
@@ -1151,7 +1110,7 @@ const static struct ipc_service_backend backend_ops = {
 /**
  * Calculates minimum size required for ICmsg region for specific number of local
  * and remote blocks. The minimum size ensures that ICmsg queue is will never overflow
- * because it can hold data message for each local block and deallocation message
+ * because it can hold data message for each local block and release message
  * for each remote block.
  */
 #define GET_ICMSG_MIN_SIZE(local_blocks, remote_blocks) \
@@ -1262,7 +1221,7 @@ DT_INST_FOREACH_STATUS_OKAY(DEFINE_BACKEND_DEVICE)
 
 static int shared_memory_prepare(void)
 {
-	int i;
+	size_t i;
 	const struct icmsg_config_t *backend_configs[] = {
 		DT_INST_FOREACH_STATUS_OKAY(BACKEND_ICMSG_CONFIG_PTR)
 	};
@@ -1278,58 +1237,3 @@ static int shared_memory_prepare(void)
 SYS_INIT(shared_memory_prepare, PRE_KERNEL_1, 1);
 
 #endif /* CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_SHMEM_RESET */
-
-/*
-
-Idea for reduced variant (around 50% size)
-------------------------------------------
-
-Device tree entry has optional field "max-epts". By default, it is EPT_ADDR_MAX,
-so it is actually taken from the Kconfig. If it is provided and it is "1", then
-simpler protocol can be used, without bounding and endpoint addressing.
-There should be 3 variants that can be determined on build time:
-- all instances have >1 endpoints - use standard protocol always
-- one instance has 1 endpoint other have more - use standard protocol, but do not
-  wait for the remote bound message on instance that has 1 endpoint. Assume
-  remote_addr=0 during endpoint configuration, this will prevent waiting.
-  Skip "bound message" and jump immediately to "bounded" state.
-  Also, ICmsg open must be moved to the endpoint registration.
-- all instances have 1 endpoint - open ICmsg on endpoint registration and call
-  bounded callback on ICmsg bounded callback. Remove unnecessary structures and
-  fields, e.g. ept_bounding_state, ept_data, ep_bound_work, waiting_bound_msg,
-  ept_count, icmsg_bounded, ept_bound_msg, Remove unnecessary functions, e.g.
-  received_free_reg_ept, ep_bound_process
-
-Detection of variant:
-#define BACKEND_DEVICE_EPT_CNT_AND(i) && (DT_INST_PROP(i, max_epts) - 1)
-#define BACKEND_DEVICE_EPT_CNT_OR(i) || (DT_INST_PROP(i, max_epts) - 1)
-#define SINGLE_EPT (!(1 DT_INST_FOREACH_STATUS_OKAY(BACKEND_DEVICE_EPT_CNT_AND)))
-#define MULTI_EPT (0 DT_INST_FOREACH_STATUS_OKAY(BACKEND_DEVICE_EPT_CNT_OR))
-
-MULTI_EPT && !SINGLE_EPT  - standard protocol
-MULTI_EPT && SINGLE_EPT   - standard protocol with reduced support
-!MULTI_EPT && SINGLE_EPT  - reduced protocol
-!MULTI_EPT && !SINGLE_EPT - N/A
-
-
-Create optional statistics
---------------------------
-
-Statistics may include:
-- number of messages/bytes send/received
-- minimum, maximum, and average packet size
-- maximum and average allocation wait time
-- maximum blocks usage
-- histogram of log2(packet size)
-
-They will be printed periodically.
-
-
-Add optional data sniffing over J-Link RTT
-------------------------------------------
-
-All send and received messages will go to the RTT data channel (including timestamps).
-On PC side, RTT log will be taken and some python script will convert it to readable
-format, e.g. HTML
-
-*/
