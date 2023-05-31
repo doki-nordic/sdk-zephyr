@@ -16,8 +16,8 @@
  * Single channel (RX or TX) of the shared memory is divided into two areas: ICmsg area
  * followed by Blocks area. ICmsg is used to send and receive short 2-byte messages.
  * Blocks area is evenly divided into aligned blocks. Blocks are used to allocate
- * buffers containing actual data. Data buffer can span on multiple blocks. First block
- * starts with size of the following data.
+ * buffers containing actual data. Data buffers can span multiple blocks. The first block
+ * starts with the size of the following data.
  *
  *  +------------+-------------+
  *  | ICmsg area | Blocks area |
@@ -33,15 +33,16 @@
  *           | size | data_buffer[size] ...          | padding |
  *           +------+--------------------------------+---------+
  *
- * Sender holds information about reserved blocks using bitarray and it is always
- * responsible for allocating and releasing the blocks. Receiver just tells sender that
- * it does not need specific buffer any more.
+ * The sender holds information about reserved blocks using bitarray and it is always
+ * responsible for allocating and releasing the blocks. The receiver just tells the sender
+ * that it does not need a specific buffer anymore.
  *
  * ICmsg messages
  * --------------
  *
- * ICmsg is used to send and receive small 2-byte messages. First byte is an endpoint
- * address or a message type, second is block index where relevant buffer starts.
+ * ICmsg is used to send and receive small 2-byte messages. The first byte is an endpoint
+ * address or a message type and the second is the block index where the relevant buffer
+ * starts.
  *
  *  - Send data
  *    | receiver endpoint address | block index |
@@ -51,18 +52,19 @@
  *
  *  - Release data
  *    | MSG_RELEASE_DATA | block index |
- *    This message is a response to "Send data" message and it is used to inform that
+ *    This message is a response to the "Send data" message and it is used to inform that
  *    specific buffer is not used anymore and can be released.
  *
  *  - Bound endpoint
  *    | MSG_BOUND | block index |
- *    This message starts bounding of the endpoint. Buffer contains sender endpoint
- *    address in the first byte followed by null-terminated endpoint name.
+ *    This message starts the bounding of the endpoint. The buffer contains the sender
+ *    endpoint address in the first byte followed by the null-terminated endpoint name.
  *
  *  - Release bound endpoint
  *    | MSG_RELEASE_BOUND | block index |
- *    This message is a response to "Bound endpoint" message and it is used to inform that
- *    specific buffer is not used anymore and specific endpoint can now receive a data.
+ *    This message is a response to the "Bound endpoint" message and it is used to inform
+ *    that a specific buffer is not used anymore and a specific endpoint can now receive
+ *    data.
  */
 
 #include <zephyr/logging/log.h>
@@ -105,6 +107,9 @@ LOG_MODULE_REGISTER(ipc_svc_icmsg_w_buf,
 
 /** Maximum ICmsg overhead. It is used to calculate size of ICmsg area. */
 #define ICMSG_BUFFER_OVERHEAD (2 * (sizeof(struct spsc_pbuf) + BYTES_PER_ICMSG_MESSAGE))
+
+/** Size of the header (size field) of the block. */
+#define BLOCK_HEADER_SIZE (offsetof(struct block_header, data))
 
 enum ept_bounding_state {
 	EPT_UNCONFIGURED = 0,	/* Endpoint in not configured (initial state). */
@@ -213,21 +218,21 @@ static uint8_t *buffer_from_index_validate(const struct channel_config *ch_conf,
 	block = block_from_index(ch_conf, block_index);
 
 	if (size != NULL) {
-		allocable_size = ch_conf->block_count * ch_conf->block_size;
-		end_ptr = ch_conf->blocks_ptr + allocable_size;
 		if (invalidate_cache) {
-			sys_cache_data_invd_range(block, ch_conf->block_size);
+			sys_cache_data_invd_range(block, BLOCK_HEADER_SIZE);
 			__sync_synchronize();
 		}
+		allocable_size = ch_conf->block_count * ch_conf->block_size;
+		end_ptr = ch_conf->blocks_ptr + allocable_size;
 		buffer_size = block->size;
-		if (buffer_size > allocable_size - offsetof(struct block_header, data) ||
+		if (buffer_size > allocable_size - BLOCK_HEADER_SIZE ||
 		    &block->data[buffer_size] > end_ptr) {
 			LOG_ERR("Block corrupted");
 			return NULL;
 		}
 		*size = buffer_size;
-		if (invalidate_cache && buffer_size > ch_conf->block_size - offsetof(struct block_header, data)) {
-			sys_cache_data_invd_range(block, buffer_size + offsetof(struct block_header, data));
+		if (invalidate_cache) {
+			sys_cache_data_invd_range(block->data, buffer_size);
 			__sync_synchronize();
 		}
 	}
@@ -246,7 +251,8 @@ static uint8_t *buffer_from_index_validate(const struct channel_config *ch_conf,
  * @return		Block index or negative error code
  * @retval -EINVAL	The buffer is not correct
  */
-static int buffer_to_index_validate(const struct channel_config *ch_conf, const uint8_t *buffer, size_t *size)
+static int buffer_to_index_validate(const struct channel_config *ch_conf,
+				    const uint8_t *buffer, size_t *size)
 {
 	size_t block_index;
 	uint8_t *expected;
@@ -266,8 +272,9 @@ static int buffer_to_index_validate(const struct channel_config *ch_conf, const 
 /**
  * Allocate buffer for transmission
  *
- * @param[in] size	Required size of the buffer. If zero, first available block is
- * 			allocated and all subsequent available blocks.
+ * @param[in,out] size	Required size of the buffer. If zero, first available block is
+ *			allocated and all subsequent available blocks. Size actually
+ *			allocated which is not less than requested.
  * @param[out] block	First allocated block. Block header contains actually allocated
  * 			bytes, so it have to be adjusted before sending.
  * @param[in] timeout	Timeout
@@ -277,11 +284,11 @@ static int buffer_to_index_validate(const struct channel_config *ch_conf, const 
  * @retval -ENOSPC	If timeout was K_NO_WAIT and there was not enough space
  * @retval -EAGAIN	If timeout occurred
  */
-static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
+static int alloc_tx_buffer(struct backend_data *dev_data, uint32_t *size,
 			   uint8_t **buffer, k_timeout_t timeout)
 {
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
-	size_t total_size = size + offsetof(struct block_header, data);
+	size_t total_size = *size + BLOCK_HEADER_SIZE;
 	size_t num_blocks = (total_size + conf->tx.block_size - 1) / conf->tx.block_size;
 	struct block_header *block;
 	bool sem_taken = false;
@@ -292,7 +299,8 @@ static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
 
 	do {
 		/* Try to allocate specified number of blocks */
-		r = sys_bitarray_alloc(conf->tx_usage_bitmap, num_blocks, &tx_block_index);
+		r = sys_bitarray_alloc(conf->tx_usage_bitmap, num_blocks,
+				       &tx_block_index);
 		if (r == -ENOSPC && !K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
 			/* Wait for releasing if there is no enough space and exit loop
 			 * on timeout */
@@ -314,19 +322,23 @@ static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
 	}
 
 	if (r < 0) {
-		if (r != -ENOSPC && r != EAGAIN) {
-			LOG_ERR("Failed to allocate buffer, error: %d", r);
+		if (r != -ENOSPC && r != -EAGAIN) {
+			LOG_ERR("Failed to allocate buffer, err: %d", r);
+			/* Only -EINVAL is allowed in this place. Any other code
+			 * indicates something wrong with the logic. */
+			__ASSERT_NO_MSG(r == -EINVAL);
 		}
 		return r;
 	}
 
 	/* If size is 0 try to allocate more blocks after already allocated. */
-	if (size == 0) {
+	if (*size == 0) {
 		prev_bit_val = 0;
 		for (next_bit = tx_block_index + 1; next_bit < conf->tx.block_count;
 		     next_bit++) {
 			r = sys_bitarray_test_and_set_bit(conf->tx_usage_bitmap, next_bit,
 							  &prev_bit_val);
+			/** Setting bit should always success. */
 			__ASSERT_NO_MSG(r == 0);
 			if (prev_bit_val) {
 				break;
@@ -335,16 +347,11 @@ static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
 		num_blocks = next_bit - tx_block_index;
 	}
 
-	/* Calculate block pointer and adjust size to actually allocated space (which is
-	 * not less that requested). */
+	/* Get block pointer and adjust size to actually allocated space. */
+	*size = conf->tx.block_size * num_blocks - BLOCK_HEADER_SIZE;
 	block = block_from_index(&conf->tx, tx_block_index);
-	block->size = conf->tx.block_size * num_blocks - offsetof(struct block_header,
-								  data);
-
-	if (buffer != NULL) {
-		*buffer = block->data;
-	}
-
+	block->size = *size;
+	*buffer = block->data;
 	return tx_block_index;
 }
 
@@ -375,17 +382,17 @@ static int release_tx_blocks(struct backend_data *dev_data, size_t tx_block_inde
 	int r;
 
 	/* Calculate number of blocks. */
-	total_size = size + offsetof(struct block_header, data);
+	total_size = size + BLOCK_HEADER_SIZE;
 	num_blocks = (total_size + conf->tx.block_size - 1) / conf->tx.block_size;
 
 	if (new_size >= 0) {
 		/* Calculate and validate new values. */
-		new_total_size = new_size + offsetof(struct block_header, data);
+		new_total_size = new_size + BLOCK_HEADER_SIZE;
 		new_num_blocks = (new_total_size + conf->tx.block_size - 1) /
 				 conf->tx.block_size;
 		if (new_num_blocks > num_blocks) {
-			LOG_ERR("Requested size bigger than allocated");
-			__ASSERT_NO_MSG(false);
+			LOG_ERR("Requested %d blocks, allocated %d", new_num_blocks,
+				num_blocks);
 			return -EINVAL;
 		}
 		/* Update actual buffer size and number of block to release. */
@@ -403,8 +410,7 @@ static int release_tx_blocks(struct backend_data *dev_data, size_t tx_block_inde
 		r = sys_bitarray_free(conf->tx_usage_bitmap, num_blocks,
 				      release_index);
 		if (r < 0) {
-			LOG_ERR("Cannot free bits");
-			__ASSERT_NO_MSG(false);
+			LOG_ERR("Cannot free bits, err %d", r);
 			return r;
 		}
 
@@ -419,8 +425,8 @@ static int release_tx_blocks(struct backend_data *dev_data, size_t tx_block_inde
  * Release all or part of the blocks occupied by the buffer.
  *
  * @param[in] buffer	Buffer to release
- * @param[in] new_size	If less than zero, release all blocks, otherwise reduce size to this
- *			value and update size in block header.
+ * @param[in] new_size	If less than zero, release all blocks, otherwise reduce size to
+ *			this value and update size in block header.
  *
  * @returns		Positive block index where the buffer starts or negative error
  * @retval -EINVAL	If invalid buffer was provided or size is greater than already
@@ -431,21 +437,22 @@ static int release_tx_buffer(struct backend_data *dev_data, const uint8_t *buffe
 {
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	size_t size;
-	int r;
+	int tx_block_index;
 
-	r = buffer_to_index_validate(&conf->tx, buffer, &size);
-	if (r < 0) {
-		return r;
+	tx_block_index = buffer_to_index_validate(&conf->tx, buffer, &size);
+	if (tx_block_index < 0) {
+		return tx_block_index;
 	}
 
-	return release_tx_blocks(dev_data, r, size, new_size);
+	return release_tx_blocks(dev_data, tx_block_index, size, new_size);
 }
 
 /**
  * Send data with ICmsg with mutex locked. Mutex must be locked because ICmsg may return
  * error on concurrent invocations even when there is enough space in queue.
  */
-static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg_type, uint8_t tx_block_index)
+static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg_type,
+			      uint8_t tx_block_index)
 {
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	uint8_t message[2] = { addr_or_msg_type, tx_block_index };
@@ -456,7 +463,7 @@ static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg
 		       sizeof(message));
 	k_mutex_unlock(&dev_data->mutex);
 	if (r < 0) {
-		LOG_ERR("Cannot send over ICmsg, error: %d", r);
+		LOG_ERR("Cannot send over ICmsg, err %d", r);
 	}
 	return r;
 }
@@ -469,38 +476,51 @@ static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg
  *
  * @return	zero or ICMsg send error
  */
-static int send_release(struct backend_data *dev_data, const uint8_t *buffer, uint8_t msg_type)
+static int send_release(struct backend_data *dev_data, const uint8_t *buffer,
+			uint8_t msg_type)
 {
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
-	int tx_block_index;
+	int rx_block_index;
 
-	tx_block_index = buffer_to_index_validate(&conf->rx, buffer, NULL);
-	if (tx_block_index < 0) {
-		return tx_block_index;
+	rx_block_index = buffer_to_index_validate(&conf->rx, buffer, NULL);
+	if (rx_block_index < 0) {
+		return rx_block_index;
 	}
 
-	return icmsg_send_wrapper(dev_data, msg_type, tx_block_index);
+	return icmsg_send_wrapper(dev_data, msg_type, rx_block_index);
 }
 
 /**
  * Send data contained in specified block. It will adjust data size and flush cache
- * if necessary.
+ * if necessary. If sending failed, allocated blocks will be released.
  *
  * @param[in] tx_block_index	Index of first block containing data, it is not validated,
  *				so caller is responsible for passing only valid index.
- * @param[in] size			Actual size of the data, can be smaller than allocated
- * @param[in] remote_addr		Remote endpoints address
+ * @param[in] size		Actual size of the data, can be smaller than allocated,
+ *				but it cannot change number of required blocks.
+ * @param[in] remote_addr	Remote endpoints address
  *
  * @return			O or negative error code
  */
-static int send_block(struct backend_data *dev_data, size_t tx_block_index, size_t size, uint8_t remote_addr)
+static int send_block(struct backend_data *dev_data, size_t tx_block_index, size_t size,
+		      uint8_t remote_addr)
 {
-	struct block_header *block = block_from_index(&dev_data->conf->tx, tx_block_index);
+	struct block_header *block;
+	int r;
+
+	block = block_from_index(&dev_data->conf->tx, tx_block_index);
 
 	block->size = size;
 	__sync_synchronize();
-	sys_cache_data_flush_range(block, size + offsetof(struct block_header, data));
-	return icmsg_send_wrapper(dev_data, remote_addr, tx_block_index);
+	sys_cache_data_flush_range(block, size + BLOCK_HEADER_SIZE);
+
+	r = icmsg_send_wrapper(dev_data, remote_addr, tx_block_index);
+
+	if (r < 0) {
+		release_tx_blocks(dev_data, tx_block_index, size, -1);
+	}
+
+	return r;
 }
 
 /**
@@ -536,7 +556,7 @@ static struct ept_data *find_ept_by_name(struct backend_data *dev_data, const ch
 /**
  * Find registered endpoint that matches given "bound endpoint" message. When found,
  * remote endpoint address is saved for future use and "release bound endpoint" message
- * is send.
+ * is send. This function must be called when mutex is locked.
  *
  * @param[in] rx_block_index	Block containing the "bound endpoint" message.
  *
@@ -548,14 +568,14 @@ static int match_bound_msg(struct backend_data *dev_data, size_t rx_block_index)
 {
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	uint8_t *buffer;
-	uint8_t remote_addr;
 	struct ept_bound_msg *msg;
 	struct ept_data *ept;
+	struct block_header *block;
 	int r = 0;
 
-	buffer = block_from_index(&conf->rx, rx_block_index)->data;
+	block = block_from_index(&conf->rx, rx_block_index);
+	buffer = block->data;
 	msg = (struct ept_bound_msg *)buffer;
-	remote_addr = msg->ept_addr;
 
 	ept = find_ept_by_name(dev_data, msg->name);
 
@@ -563,7 +583,7 @@ static int match_bound_msg(struct backend_data *dev_data, size_t rx_block_index)
 		return 0;
 	}
 
-	ept->remote_addr = remote_addr;
+	ept->remote_addr = msg->ept_addr;
 
 	k_mutex_unlock(&dev_data->mutex);
 	r = send_release(dev_data, buffer, MSG_RELEASE_BOUND);
@@ -579,29 +599,26 @@ static int match_bound_msg(struct backend_data *dev_data, size_t rx_block_index)
 /**
  * Send bound message on specified endpoint.
  *
- * @param[in] ept	Endpoint to send
+ * @param[in] ept	Endpoint to use
  *
  * @return		O or negative error code
  */
 static int send_bound_message(struct backend_data *dev_data, struct ept_data *ept)
 {
 	size_t msg_len;
+	uint32_t alloc_size;
 	uint8_t *buffer;
 	struct ept_bound_msg *msg;
 	int r;
 
 	msg_len = offsetof(struct ept_bound_msg, name) + strlen(ept->cfg->name) + 1;
-	r = alloc_tx_buffer(dev_data, msg_len, &buffer, K_FOREVER);
+	alloc_size = msg_len;
+	r = alloc_tx_buffer(dev_data, &alloc_size, &buffer, K_FOREVER);
 	if (r >= 0) {
 		msg = (struct ept_bound_msg *)buffer;
 		msg->ept_addr = ept->local_addr;
 		strcpy(msg->name, ept->cfg->name);
 		r = send_block(dev_data, r, msg_len, MSG_BOUND);
-		/* ICMsg queue should have enough space for all blocks. */
-		__ASSERT_NO_MSG(r == 0);
-	} else {
-		/* EP name cannot be bigger then entire allocable space. */
-		__ASSERT_NO_MSG(false);
 	}
 
 	return r;
@@ -621,7 +638,8 @@ static void schedule_ept_bound_process(struct backend_data *dev_data)
  */
 static void ept_bound_process(struct k_work *item)
 {
-	struct backend_data *dev_data = CONTAINER_OF(item, struct backend_data, ep_bound_work);
+	struct backend_data *dev_data = CONTAINER_OF(item, struct backend_data,
+						     ep_bound_work);
 	struct ept_data *ept = NULL;
 	size_t i;
 	int r = 0;
@@ -648,6 +666,7 @@ static void ept_bound_process(struct k_work *item)
 
 	for (i = 0; i < dev_data->ept_count; i++) {
 		ept = &dev_data->ept[i];
+		/* If any endpoint is configured, start bounding. */
 		if (ept->state == EPT_CONFIGURED) {
 			ept->state = EPT_BOUNDING;
 			k_mutex_unlock(&dev_data->mutex);
@@ -657,8 +676,10 @@ static void ept_bound_process(struct k_work *item)
 				ept->state = EPT_UNCONFIGURED;
 				goto exit;
 			}
-		} else if (ept->state == EPT_BOUNDED && ept->remote_addr != EPT_ADDR_INVALID) {
-			/* Call bound callback if endpoint is bound. */
+		/* If any endpoint is bounded and remote address is known, call the
+		 * bound callback. */
+		} else if (ept->state == EPT_BOUNDED
+			   && ept->remote_addr != EPT_ADDR_INVALID) {
 			ept->state = EPT_READY;
 			k_mutex_unlock(&dev_data->mutex);
 			if (ept->cfg->cb.bound != NULL) {
@@ -672,15 +693,15 @@ exit:
 	k_mutex_unlock(&dev_data->mutex);
 	if (r < 0) {
 		schedule_ept_bound_process(dev_data);
-		LOG_ERR("Failed to process bounding, error %d", r);
-		__ASSERT_NO_MSG(false);
+		LOG_ERR("Failed to process bounding, err %d", r);
 	}
 }
 
 /**
  * Data message received.
  */
-static int received_data(struct backend_data *dev_data, size_t rx_block_index, int local_addr)
+static int received_data(struct backend_data *dev_data, size_t rx_block_index,
+			 int local_addr)
 {
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	uint8_t *buffer;
@@ -691,10 +712,9 @@ static int received_data(struct backend_data *dev_data, size_t rx_block_index, i
 
 	/* Validate */
 	buffer = buffer_from_index_validate(&conf->rx, rx_block_index, &size, true);
-	if (buffer == NULL ||
-	    local_addr >= CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP) {
-		LOG_ERR("Received invalid block index: %d", rx_block_index);
-		__ASSERT_NO_MSG(false);
+	if (buffer == NULL || local_addr >= dev_data->ept_count) {
+		LOG_ERR("Received invalid block index %d or addr %d", rx_block_index,
+			local_addr);
 		return -EINVAL;
 	}
 
@@ -739,20 +759,16 @@ static int received_bound(struct backend_data *dev_data, size_t rx_block_index)
 	const struct icmsg_with_buf_config *conf = dev_data->conf;
 	size_t size;
 	uint8_t *buffer;
-	bool is_bounded;
 	size_t i;
 	int r = -ENOMEM;
 
 	buffer = buffer_from_index_validate(&conf->rx, rx_block_index, &size, true);
 	if (buffer == NULL) {
-		LOG_ERR("Received invalid block index: %d", rx_block_index);
-		__ASSERT_NO_MSG(false);
+		LOG_ERR("Received invalid block index %d", rx_block_index);
 		return -EINVAL;
 	}
 
 	k_mutex_lock(&dev_data->mutex, K_FOREVER);
-
-	is_bounded = dev_data->icmsg_bounded;
 
 	/* Find empty entry in waiting list and put this block to it. */
 	for (i = 0; i < CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP; i++) {
@@ -765,14 +781,11 @@ static int received_bound(struct backend_data *dev_data, size_t rx_block_index)
 
 	k_mutex_unlock(&dev_data->mutex);
 
-	/* If ICmsg is already bounded, schedule processing the message */
-	if (is_bounded) {
-		schedule_ept_bound_process(dev_data);
-	}
+	/* Schedule processing the message */
+	schedule_ept_bound_process(dev_data);
 
 	if (r < 0) {
-		LOG_ERR("Remote requires more endpoints than available");
-		__ASSERT_NO_MSG(false);
+		LOG_ERR("Too many remote endpoints");
 	}
 
 	return r;
@@ -800,9 +813,8 @@ static int received_release_bound(struct backend_data *dev_data, size_t tx_block
 
 	r = release_tx_blocks(dev_data, tx_block_index, size, -1);
 
-	if (local_addr >= CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_NUM_EP) {
-		LOG_ERR("Invalid ept address");
-		__ASSERT_NO_MSG(false);
+	if (local_addr >= dev_data->ept_count) {
+		LOG_ERR("Invalid address %d", local_addr);
 		return -EINVAL;
 	}
 
@@ -857,8 +869,7 @@ static void received(const void *data, size_t len, void *priv)
 
 exit:
 	if (r < 0) {
-		LOG_ERR("Failed to receive, error %d", r);
-		__ASSERT_NO_MSG(false);
+		LOG_ERR("Failed to receive, err %d", r);
 	}
 }
 
@@ -902,14 +913,16 @@ static int open(const struct device *instance)
 		(uint32_t)conf->tx.block_size,
 		(uint32_t)conf->tx.blocks_ptr,
 		(uint32_t)(conf->tx.block_size * conf->tx.block_count -
-			   offsetof(struct block_header, data)));
+			   BLOCK_HEADER_SIZE));
 	LOG_DBG("  RX %d blocks of %d bytes at 0x%08X, max allocable %d bytes",
 		(uint32_t)conf->rx.block_count,
 		(uint32_t)conf->rx.block_size,
 		(uint32_t)conf->rx.blocks_ptr,
 		(uint32_t)(conf->rx.block_size * conf->tx.block_count -
-			   offsetof(struct block_header, data)));
-	return icmsg_open(&conf->icmsg_config, &dev_data->icmsg_data, &cb, (void *)instance);
+			   BLOCK_HEADER_SIZE));
+
+	return icmsg_open(&conf->icmsg_config, &dev_data->icmsg_data, &cb,
+			  (void *)instance);
 }
 
 /**
@@ -919,11 +932,13 @@ static int send(const struct device *instance, void *token, const void *msg, siz
 {
 	struct backend_data *dev_data = instance->data;
 	struct ept_data *ept = token;
+	uint32_t alloc_size;
 	uint8_t *buffer;
 	int r;
 
 	/* Allocate the buffer. */
-	r = alloc_tx_buffer(dev_data, len, &buffer, K_FOREVER);
+	alloc_size = len;
+	r = alloc_tx_buffer(dev_data, &alloc_size, &buffer, K_FOREVER);
 	if (r < 0) {
 		return r;
 	}
@@ -932,14 +947,7 @@ static int send(const struct device *instance, void *token, const void *msg, siz
 	memcpy(buffer, msg, len);
 
 	/* Send data message. */
-	r = send_block(dev_data, r, len, ept->remote_addr);
-
-	/* Remove buffer if something gone wrong - buffer was not send */
-	if (r < 0) {
-		release_tx_buffer(dev_data, buffer, -1);
-	}
-
-	return r;
+	return send_block(dev_data, r, len, ept->remote_addr);
 }
 
 /**
@@ -986,8 +994,7 @@ static int get_tx_buffer_size(const struct device *instance, void *token)
 {
 	const struct icmsg_with_buf_config *conf = instance->config;
 
-	return (conf->tx.block_size * conf->tx.block_count -
-		offsetof(struct block_header, data));
+	return conf->tx.block_size * conf->tx.block_count - BLOCK_HEADER_SIZE;
 }
 
 /**
@@ -997,17 +1004,13 @@ static int get_tx_buffer(const struct device *instance, void *token, void **data
 			 uint32_t *user_len, k_timeout_t wait)
 {
 	struct backend_data *dev_data = instance->data;
-	struct block_header *block;
 	int r;
 
-	r = alloc_tx_buffer(dev_data, *user_len, (uint8_t **)data, wait);
-	if (r >= 0) {
-		block = CONTAINER_OF(*data, struct block_header, data);
-		*user_len = block->size;
-		r = 0;
+	r = alloc_tx_buffer(dev_data, user_len, (uint8_t **)data, wait);
+	if (r < 0) {
+		return r;
 	}
-
-	return r;
+	return 0;
 }
 
 /**
@@ -1037,14 +1040,7 @@ static int send_nocopy(const struct device *instance, void *token, const void *d
 		return r;
 	}
 
-	r = send_block(dev_data, r, len, ept->remote_addr);
-
-	/* Remove buffer if something gone wrong - buffer was not send */
-	if (r < 0) {
-		release_tx_buffer(dev_data, data, -1);
-	}
-
-	return r;
+	return send_block(dev_data, r, len, ept->remote_addr);
 }
 
 /**
@@ -1058,9 +1054,7 @@ static int hold_rx_buffer(const struct device *instance, void *token, void *data
 
 	/* Calculate block index and set associated bit. */
 	rx_block_index = buffer_to_index_validate(&conf->rx, buffer, NULL);
-	if (rx_block_index < 0) {
-		return rx_block_index;
-	}
+	__ASSERT_NO_MSG(rx_block_index >= 0);
 	return sys_bitarray_set_bit(conf->rx_hold_bitmap, rx_block_index);
 }
 
