@@ -346,7 +346,7 @@ static int alloc_tx_buffer(struct backend_data *dev_data, size_t size,
 	}
 
 	if (r < 0) {
-		if (r != -EBUSY && r != EAGAIN) {
+		if (r != -ENOSPC && r != EAGAIN) {
 			LOG_ERR("Failed to allocate buffer, error: %d", r);
 		}
 		POP;
@@ -935,13 +935,13 @@ static int open(const struct device *instance)
 		(uint32_t)conf->icmsg_config.tx_shm_addr,
 		(uint32_t)conf->icmsg_config.tx_shm_size,
 		(uint32_t)conf->icmsg_config.tx_shm_addr);
-	LOG_DBG("  TX %d blocks of %d bytes at 0x%08X, max block %d bytes",
+	LOG_DBG("  TX %d blocks of %d bytes at 0x%08X, max allocable %d bytes",
 		(uint32_t)conf->tx.block_count,
 		(uint32_t)conf->tx.block_size,
 		(uint32_t)conf->tx.blocks_ptr,
 		(uint32_t)(conf->tx.block_size * conf->tx.block_count -
 			   offsetof(struct block_header, data)));
-	LOG_DBG("  RX %d blocks of %d bytes at 0x%08X, max block %d bytes",
+	LOG_DBG("  RX %d blocks of %d bytes at 0x%08X, max allocable %d bytes",
 		(uint32_t)conf->rx.block_count,
 		(uint32_t)conf->rx.block_size,
 		(uint32_t)conf->rx.blocks_ptr,
@@ -1278,3 +1278,58 @@ static int shared_memory_prepare(void)
 SYS_INIT(shared_memory_prepare, PRE_KERNEL_1, 1);
 
 #endif /* CONFIG_IPC_SERVICE_BACKEND_ICMSG_WITH_BUF_SHMEM_RESET */
+
+/*
+
+Idea for reduced variant (around 50% size)
+------------------------------------------
+
+Device tree entry has optional field "max-epts". By default, it is EPT_ADDR_MAX,
+so it is actually taken from the Kconfig. If it is provided and it is "1", then
+simpler protocol can be used, without bounding and endpoint addressing.
+There should be 3 variants that can be determined on build time:
+- all instances have >1 endpoints - use standard protocol always
+- one instance has 1 endpoint other have more - use standard protocol, but do not
+  wait for the remote bound message on instance that has 1 endpoint. Assume
+  remote_addr=0 during endpoint configuration, this will prevent waiting.
+  Skip "bound message" and jump immediately to "bounded" state.
+  Also, ICmsg open must be moved to the endpoint registration.
+- all instances have 1 endpoint - open ICmsg on endpoint registration and call
+  bounded callback on ICmsg bounded callback. Remove unnecessary structures and
+  fields, e.g. ept_bounding_state, ept_data, ep_bound_work, waiting_bound_msg,
+  ept_count, icmsg_bounded, ept_bound_msg, Remove unnecessary functions, e.g.
+  received_free_reg_ept, ep_bound_process
+
+Detection of variant:
+#define BACKEND_DEVICE_EPT_CNT_AND(i) && (DT_INST_PROP(i, max_epts) - 1)
+#define BACKEND_DEVICE_EPT_CNT_OR(i) || (DT_INST_PROP(i, max_epts) - 1)
+#define SINGLE_EPT (!(1 DT_INST_FOREACH_STATUS_OKAY(BACKEND_DEVICE_EPT_CNT_AND)))
+#define MULTI_EPT (0 DT_INST_FOREACH_STATUS_OKAY(BACKEND_DEVICE_EPT_CNT_OR))
+
+MULTI_EPT && !SINGLE_EPT  - standard protocol
+MULTI_EPT && SINGLE_EPT   - standard protocol with reduced support
+!MULTI_EPT && SINGLE_EPT  - reduced protocol
+!MULTI_EPT && !SINGLE_EPT - N/A
+
+
+Create optional statistics
+--------------------------
+
+Statistics may include:
+- number of messages/bytes send/received
+- minimum, maximum, and average packet size
+- maximum and average allocation wait time
+- maximum blocks usage
+- histogram of log2(packet size)
+
+They will be printed periodically.
+
+
+Add optional data sniffing over J-Link RTT
+------------------------------------------
+
+All send and received messages will go to the RTT data channel (including timestamps).
+On PC side, RTT log will be taken and some python script will convert it to readable
+format, e.g. HTML
+
+*/
