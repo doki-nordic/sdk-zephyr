@@ -5,22 +5,22 @@
  */
 
 /*
- * ICmsg with buffers backend.
+ * ICMsg with buffers backend.
  *
  * This is an IPC service backend that dynamically allocates buffers for data transmission
- * and uses ICmsg as a signaling transport.
+ * and uses ICMsg as a signaling transport.
  *
  * Shared memory organization
  * --------------------------
  *
- * Single channel (RX or TX) of the shared memory is divided into two areas: ICmsg area
- * followed by Blocks area. ICmsg is used to send and receive short 2-byte messages.
+ * Single channel (RX or TX) of the shared memory is divided into two areas: ICMsg area
+ * followed by Blocks area. ICMsg is used to send and receive short 2-byte messages.
  * Blocks area is evenly divided into aligned blocks. Blocks are used to allocate
  * buffers containing actual data. Data buffers can span multiple blocks. The first block
  * starts with the size of the following data.
  *
  *  +------------+-------------+
- *  | ICmsg area | Blocks area |
+ *  | ICMsg area | Blocks area |
  *  +------------+-------------+
  *       _______/               \_________________________________________
  *      /                                                                 \
@@ -37,10 +37,10 @@
  * responsible for allocating and releasing the blocks. The receiver just tells the sender
  * that it does not need a specific buffer anymore.
  *
- * ICmsg messages
+ * ICMsg messages
  * --------------
  *
- * ICmsg is used to send and receive small 2-byte messages. The first byte is an endpoint
+ * ICMsg is used to send and receive small 2-byte messages. The first byte is an endpoint
  * address or a message type and the second is the block index where the relevant buffer
  * starts.
  *
@@ -102,10 +102,10 @@ LOG_MODULE_REGISTER(ipc_svc_icmsg_w_buf,
 /** Alignment of a block */
 #define BLOCK_ALIGNMENT sizeof(size_t)
 
-/** Number of bytes per each ICmsg message. It is used to calculate size of ICmsg area. */
+/** Number of bytes per each ICMsg message. It is used to calculate size of ICMsg area. */
 #define BYTES_PER_ICMSG_MESSAGE 8
 
-/** Maximum ICmsg overhead. It is used to calculate size of ICmsg area. */
+/** Maximum ICMsg overhead. It is used to calculate size of ICMsg area. */
 #define ICMSG_BUFFER_OVERHEAD (2 * (sizeof(struct spsc_pbuf) + BYTES_PER_ICMSG_MESSAGE))
 
 /** Size of the header (size field) of the block. */
@@ -130,7 +130,7 @@ struct channel_config {
 };
 
 struct icmsg_with_buf_config {
-	struct icmsg_config_t icmsg_config;	/**< Configuration of the ICmsg. */
+	struct icmsg_config_t icmsg_config;	/**< Configuration of the ICMsg. */
 	struct channel_config rx;		/**< RX channel config. */
 	struct channel_config tx;		/**< RX channel config. */
 	sys_bitarray_t *tx_usage_bitmap;	/**< Bit is set when TX block is in use */
@@ -150,7 +150,7 @@ struct ept_data {
 
 struct backend_data {
 	const struct icmsg_with_buf_config* conf; /**< Backend instance config. */
-	struct icmsg_data_t icmsg_data;	/**< ICmsg data. */
+	struct icmsg_data_t icmsg_data;	/**< ICMsg data. */
 	struct k_mutex mutex;		/**< Mutex to protect common data and resources.*/
 	struct k_work ep_bound_work;	/**< Work item for bounding processing. */
 	struct k_sem block_wait_sem;	/**< Semaphore for waiting for free blocks. */
@@ -448,7 +448,7 @@ static int release_tx_buffer(struct backend_data *dev_data, const uint8_t *buffe
 }
 
 /**
- * Send data with ICmsg with mutex locked. Mutex must be locked because ICmsg may return
+ * Send data with ICMsg with mutex locked. Mutex must be locked because ICMsg may return
  * error on concurrent invocations even when there is enough space in queue.
  */
 static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg_type,
@@ -463,7 +463,7 @@ static int icmsg_send_wrapper(struct backend_data *dev_data, uint8_t addr_or_msg
 		       sizeof(message));
 	k_mutex_unlock(&dev_data->mutex);
 	if (r < 0) {
-		LOG_ERR("Cannot send over ICmsg, err %d", r);
+		LOG_ERR("Cannot send over ICMsg, err %d", r);
 	}
 	return r;
 }
@@ -903,7 +903,7 @@ static int open(const struct device *instance)
 	};
 
 	LOG_DBG("Open instance 0x%08X", (uint32_t)instance);
-	LOG_DBG("  ICmsg, TX %d at 0x%08X, RX %d at 0x%08X",
+	LOG_DBG("  ICMsg, TX %d at 0x%08X, RX %d at 0x%08X",
 		(uint32_t)conf->icmsg_config.tx_shm_size,
 		(uint32_t)conf->icmsg_config.tx_shm_addr,
 		(uint32_t)conf->icmsg_config.tx_shm_size,
@@ -1102,8 +1102,8 @@ const static struct ipc_service_backend backend_ops = {
 };
 
 /**
- * Calculates minimum size required for ICmsg region for specific number of local
- * and remote blocks. The minimum size ensures that ICmsg queue is will never overflow
+ * Calculates minimum size required for ICMsg region for specific number of local
+ * and remote blocks. The minimum size ensures that ICMsg queue is will never overflow
  * because it can hold data message for each local block and release message
  * for each remote block.
  */
@@ -1112,14 +1112,14 @@ const static struct ipc_service_backend backend_ops = {
 
 /**
  * Calculate aligned block size by evenly dividing remaining space after removing
- * the space for ICmsg.
+ * the space for ICMsg.
  */
 #define GET_BLOCK_SIZE(total_size, local_blocks, remote_blocks) ROUND_DOWN(		\
 	((total_size) - GET_ICMSG_MIN_SIZE((local_blocks), (remote_blocks))) /		\
 	(local_blocks), BLOCK_ALIGNMENT)
 
 /**
- * Calculate offset where area for blocks starts which is just after the ICmsg.
+ * Calculate offset where area for blocks starts which is just after the ICMsg.
  */
 #define GET_BLOCKS_OFFSET(total_size, local_blocks, remote_blocks)			\
 	((total_size) - GET_BLOCK_SIZE((total_size), (local_blocks), (remote_blocks)) *	\
