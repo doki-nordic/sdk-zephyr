@@ -8,6 +8,8 @@ menu "Zephyr"
 source "Kconfig.zephyr"
 endmenu
 
+rsource "interoperability/Kconfig"
+
 config IPC_TEST_MSG_HEAP_SIZE
 	int "The heap to copy processed messages"
 	default 512
