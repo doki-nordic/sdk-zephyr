@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 
+rsource "interoperability/Kconfig"
+
 menu "Zephyr"
 source "Kconfig.zephyr"
 endmenu
@@ -20,3 +22,8 @@ config IPC_TEST_SKIP_CORE_RESET
 	help
 		Some of the cores cannot be safely restarted.
 		Skip the tests that require it in such a cases.
+
+config IPC_TEST_SKIP_UNBOUND
+	bool "Skip unbound tests"
+	help
+		Whether to skip tests that requires unbound callback functionality.
