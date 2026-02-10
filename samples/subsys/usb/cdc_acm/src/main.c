@@ -97,6 +97,34 @@ static int enable_usb_device_next(void)
 	return 0;
 }
 
+static uint8_t sample_buffer[] = "Hello from Zephyr USB CDC ACM sample!\r\n"
+	"This is example text.\r\n"
+	"Lorem ipsum dolor sit amet, consectetur adipiscing elit.\r\n"
+	"Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\r\n"
+	"Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip\r\n"
+	"ex ea commodo consequat.\r\n"
+	"Hello from Zephyr USB CDC ACM sample!\r\n"
+	"This is example text.\r\n"
+	"Lorem ipsum dolor sit amet, consectetur adipiscing elit.\r\n"
+	"Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\r\n"
+	"Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip\r\n"
+	"ex ea commodo consequat.\r\n"
+	"Hello from Zephyr USB CDC ACM sample!\r\n"
+	"This is example text.\r\n"
+	"Lorem ipsum dolor sit amet, consectetur adipiscing elit.\r\n"
+	"Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\r\n"
+	"Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip\r\n"
+	"ex ea commodo consequat.\r\n"
+	"Hello from Zephyr USB CDC ACM sample!\r\n"
+	"This is example text.\r\n"
+	"Lorem ipsum dolor sit amet, consectetur adipiscing elit.\r\n"
+	"Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\r\n"
+	"Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip\r\n"
+	"ex ea commodo consequat.\r\n"
+	"\r\n";
+int bytes = 0;
+uint64_t start = 0;
+
 static void interrupt_handler(const struct device *dev, void *user_data)
 {
 	ARG_UNUSED(user_data);
@@ -133,30 +161,77 @@ static void interrupt_handler(const struct device *dev, void *user_data)
 		}
 
 		if (uart_irq_tx_ready(dev)) {
-			uint8_t buffer[64];
-			int rb_len, send_len;
+			// uint8_t buffer[64];
+			// int rb_len;
+			int send_len;
 
-			rb_len = ring_buf_get(&ringbuf, buffer, sizeof(buffer));
-			if (!rb_len) {
-				LOG_DBG("Ring buffer empty, disable TX IRQ");
-				uart_irq_tx_disable(dev);
-				continue;
-			}
+			// rb_len = ring_buf_get(&ringbuf, buffer, sizeof(buffer));
+			// if (!rb_len) {
+			// 	LOG_DBG("Ring buffer empty, disable TX IRQ");
+			// 	uart_irq_tx_disable(dev);
+			// 	continue;
+			// }
 
 			if (rx_throttled) {
 				uart_irq_rx_enable(dev);
 				rx_throttled = false;
 			}
 
-			send_len = uart_fifo_fill(dev, buffer, rb_len);
-			if (send_len < rb_len) {
-				LOG_ERR("Drop %d bytes", rb_len - send_len);
+			if (bytes == 0) {
+				start = k_uptime_get();
+			}
+
+			send_len = uart_fifo_fill(dev, sample_buffer, sizeof(sample_buffer) - 1);
+			if (send_len < 0) {
+				LOG_ERR("Failed to write to UART FIFO %d", send_len);
+				send_len = 0;
+			} else if (send_len == 0) {
+				LOG_ERR("UART FIFO full, cannot send data");
+			} else if (send_len < sizeof(sample_buffer) - 1) {
+				//LOG_ERR("Drop %d bytes", sizeof(sample_buffer) - 1 - send_len);
+			}
+
+			if (send_len > 0) {
+				bytes += send_len;
+				if (bytes >= 1024 * 1024) {
+					uint64_t end = k_uptime_get();
+					uint64_t duration = end - start;
+					uint64_t speed = (bytes * 1000) / duration;
+					bytes = 0;
+					LOG_INF("Speed %d bytes/s", (int)speed);
+				}
 			}
 
 			LOG_DBG("ringbuf -> tty fifo %d bytes", send_len);
 		}
 	}
 }
+
+// void send_as_much_as_possible()
+// {
+// 	int bytes = 0;
+// 	uint64_t start = k_uptime_get();
+// 	while (true) {
+// 		int send_len = uart_fifo_fill(uart_dev, buffer, sizeof(buffer) - 1);
+// 		if (send_len <= 0) {
+// 			LOG_ERR("Failed to write to UART FIFO %d", send_len);
+// 			k_sleep(K_USEC(2 * 64));
+// 			continue;
+// 		} else if (send_len < sizeof(buffer) - 1) {
+// 			int dropped = sizeof(buffer) - 1 - send_len;
+// 			k_sleep(K_USEC(2 * dropped));
+// 		}
+// 		bytes += send_len;
+// 		if (bytes >= 1024 * 1024) {
+// 			uint64_t end = k_uptime_get();
+// 			uint64_t duration = end - start;
+// 			uint64_t speed = (bytes * 1000) / duration;
+// 			bytes = 0;
+// 			start = end;
+// 			LOG_INF("Speed %d bytes/s", (int)speed);
+// 		}
+// 	}
+// }
 
 int main(void)
 {
@@ -196,6 +271,8 @@ int main(void)
 	uart_irq_callback_set(uart_dev, interrupt_handler);
 	/* Enable rx interrupts */
 	uart_irq_rx_enable(uart_dev);
+
+	// send_as_much_as_possible();
 
 	return 0;
 }
